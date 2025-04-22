@@ -1,11 +1,12 @@
-CREATE OR REPLACE PROCEDURE CREATE_TABLE_FROM_JSON()
+CREATE OR REPLACE PROCEDURE APRICOT_DEV_RAW.COMMON.CREATE_TABLE_FROM_JSON()
 RETURNS STRING
 LANGUAGE JAVASCRIPT
 AS
 $$
     // Get all rows from the table
+    //  WHERE raw_json_data:metadata.tenant_id = 'apricot_103326' AND raw_json_data:metadata.source_table = 'data_16'
     var getJSONData = snowflake.createStatement({
-        sqlText: `SELECT * FROM APRICOT_DEV_RAW.COMMON.dev_cvi_raw_poc`
+        sqlText: `SELECT * FROM APRICOT_DEV_RAW.COMMON.dev_cvi_raw_poc WHERE _loaded_at > DATEADD(HOURS, -1, CURRENT_TIMESTAMP())`
     });
     var result = getJSONData.execute();
     
@@ -55,6 +56,8 @@ $$
                     return 'DATE';
                 case 'JSON':
                     return 'VARIANT';
+                case 'BLOB':
+                    return 'VARIANT';
                 default:
                     return dataType.toUpperCase();
             }
@@ -63,17 +66,38 @@ $$
         // Function to generate column definition
         function generateColumnDef(column, includeDefaults = true) {
             let def = `${column.name} ${getSQLDataType(column.data_type, column.max_length)}`;
-            if (!column.nullable) {
-                def += ' NOT NULL';
-            }
-            if (includeDefaults && column.default_value !== null) {
-                if (column.data_type.toUpperCase() === 'TIMESTAMP') {
-                    // For TIMESTAMP, cast the default value to TIMESTAMP
-                    def += ` DEFAULT TIMESTAMP_NTZ_FROM_PARTS(1970, 1, 1, 0, 0, 0)`;
-                } else {
-                    def += ` DEFAULT ${column.default_value === '' ? "''" : column.default_value}`;
-                }
-            }
+            
+            // Handle NOT NULL constraint
+            // Always apply NOT NULL if column is not nullable, regardless of default value
+            // f (!column.nullable) {
+            //    def += ' NOT NULL';
+            // 
+            
+            // Handle default values only if includeDefaults is true
+            // if (includeDefaults && column.default_value !== null) {
+            //     switch(column.data_type.toUpperCase()) {
+            //         case 'TIMESTAMP':
+            //             def += ` DEFAULT TIMESTAMP_NTZ_FROM_PARTS(1970, 1, 1, 0, 0, 0)`;
+            //             break;
+            //         case 'DATE':
+            //             def += ` DEFAULT DATE_FROM_PARTS(1970, 1, 1)`;
+            //             break;
+            //         case 'VARCHAR':
+            //             def += ` DEFAULT ${column.default_value === '' ? "''" : `'${column.default_value}'`}`;
+            //             break;
+            //         case 'INTEGER':
+            //         case 'TINYINT':
+            //             def += ` DEFAULT ${column.default_value || 0}`;
+            //             break;
+            //         case 'JSON':
+            //         case 'VARIANT':
+            //             def += ` DEFAULT PARSE_JSON('{}')`;
+            //             break;
+            //         default:
+            //             def += ` DEFAULT ${column.default_value}`;
+            //     }
+            // }
+            
             return def;
         }
 
@@ -83,6 +107,7 @@ $$
         // Add columns
         const columnDefs = JSON_DATA.columns.map(col => generateColumnDef(col, true));
         createTableSQL += columnDefs.join(',\n');
+        createTableSQL += ',\n_loaded_at TIMESTAMP_LTZ(9) DEFAULT CURRENT_TIMESTAMP()';
         
         // Add primary key if exists
         if (JSON_DATA.keys.primary_key && JSON_DATA.keys.primary_key.length > 0) {
@@ -134,82 +159,90 @@ $$
                 });
                 alterTableStmt.execute();
             }
-            
-            // Insert data using appropriate method based on whether we needed to alter the table
-            if (needsAlter || existingColumns.size === 0) {
-                // Use INSERT INTO when we've altered the table or created it
-                var insertSQL = `INSERT INTO ${targetTableName}\n`;
-                insertSQL += `SELECT\n`;
-                
-                // Add column list for INSERT
-                const columnList = JSON_DATA.columns.map(col => 
-                    `f.value:${col.name}::${getSQLDataType(col.data_type, col.max_length)}`
-                ).join(',\n    ');
-                
-                insertSQL += `    ${columnList}\n`;
-                insertSQL += `FROM TABLE(FLATTEN(input => PARSE_JSON('${JSON.stringify(JSON_DATA.data)}'))) f;`;
-                
-                var insertStmt = snowflake.createStatement({
-                    sqlText: insertSQL
-                });
-                insertStmt.execute();
-            } else {
-                // Use COPY INTO when no schema changes were needed
-                // Create a temporary table to stage the JSON data
-                var tempTableName = `${targetTableName}_TEMP`;
-                var createTempTableSQL = `CREATE OR REPLACE TEMPORARY TABLE ${tempTableName} (data VARIANT);`;
-                var createTempTableStmt = snowflake.createStatement({
-                    sqlText: createTempTableSQL
-                });
-                createTempTableStmt.execute();
-                
-                // Insert JSON data into temporary table
-                var insertTempSQL = `INSERT INTO ${tempTableName} SELECT PARSE_JSON('${JSON.stringify(JSON_DATA.data)}');`;
-                var insertTempStmt = snowflake.createStatement({
-                    sqlText: insertTempSQL
-                });
-                insertTempStmt.execute();
-                
-                // Create a temporary stage
-                var stageName = `${targetTableName}_STAGE`;
-                var createStageSQL = `CREATE OR REPLACE STAGE ${stageName};`;
-                var createStageStmt = snowflake.createStatement({
-                    sqlText: createStageSQL
-                });
-                createStageStmt.execute();
-                
-                // Copy data from temporary table to stage
-                var copyToStageSQL = `COPY INTO @${stageName}/data.json FROM ${tempTableName} FILE_FORMAT = (TYPE = 'JSON');`;
-                var copyToStageStmt = snowflake.createStatement({
-                    sqlText: copyToStageSQL
-                });
-                copyToStageStmt.execute();
-                
-                // Use COPY INTO with the stage
-                var copySQL = `COPY INTO ${targetTableName}\n`;
-                copySQL += `FROM @${stageName}\n`;
-                copySQL += `FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = TRUE)\n`;
-                copySQL += `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE\n`;
-                copySQL += `FORCE = TRUE;`;
-                
-                var copyStmt = snowflake.createStatement({
-                    sqlText: copySQL
-                });
-                copyStmt.execute();
-                
-                // Clean up
-                var dropStageSQL = `DROP STAGE IF EXISTS ${stageName};`;
-                var dropStageStmt = snowflake.createStatement({
-                    sqlText: dropStageSQL
-                });
-                dropStageStmt.execute();
-                
-                var dropTempTableSQL = `DROP TABLE IF EXISTS ${tempTableName};`;
-                var dropTempTableStmt = snowflake.createStatement({
-                    sqlText: dropTempTableSQL
-                });
-                dropTempTableStmt.execute();
+
+            // Check for primary key requirement
+            if (!JSON_DATA.keys.primary_key || JSON_DATA.keys.primary_key.length === 0) {
+                throw "Error: Primary key is required for MERGE operation";
             }
+
+            // Create a temporary table to hold the new data
+            var tempTableName = `${targetTableName}_TEMP`;
+            var tempTableSQL = `CREATE OR REPLACE TEMPORARY TABLE ${tempTableName} (\n`;
+            tempTableSQL += columnDefs.join(',\n');
+            tempTableSQL += '\n);\n\n';
+
+            var createTempTableStmt = snowflake.createStatement({
+                sqlText: tempTableSQL
+            });
+            createTempTableStmt.execute();
+
+            // Insert the JSON data into the temporary table
+            const escapedJSONData = JSON.stringify(JSON_DATA.data)
+                    .replace(/\\/g, '\\\\')
+                    .replace(/'/g, "\\'");
+
+            // Add column list for INSERT
+            const columnNames = JSON_DATA.columns.map(col => col.name).join(',\n    ');
+            const columnValues = JSON_DATA.columns.map(col => {
+                if (col.data_type.toUpperCase() === 'JSON') {
+                    return `PARSE_JSON(f.value:${col.name}::STRING)`;
+                }
+                return `f.value:${col.name}::${getSQLDataType(col.data_type, col.max_length)}`;
+            }).join(',\n    ');
+
+            var insertTempSQL = `INSERT INTO ${tempTableName} (${columnNames})\n`;
+            insertTempSQL += `SELECT\n    ${columnValues}\n`;
+            insertTempSQL += `FROM TABLE(FLATTEN(input => PARSE_JSON('${escapedJSONData}'))) f;\n\n`;
+
+            var insertTempStmt = snowflake.createStatement({
+                sqlText: insertTempSQL
+            });
+            insertTempStmt.execute();
+
+            // Generate MERGE statement
+            const primaryKeyJoinCondition = JSON_DATA.keys.primary_key
+                .map(key => `TARGET.${key} = SOURCE.${key}`)
+                .join(' AND ');
+
+            const updateSetClause = JSON_DATA.columns
+                .filter(col => !JSON_DATA.keys.primary_key.includes(col.name))
+                .map(col => `${col.name} = SOURCE.${col.name}`)
+                .join(',\n    ');
+
+            var mergeSQL = `MERGE INTO ${targetTableName} AS TARGET\n`;
+            mergeSQL += `USING ${tempTableName} AS SOURCE\n`;
+            mergeSQL += `ON ${primaryKeyJoinCondition}\n`;
+            mergeSQL += `WHEN MATCHED THEN\n`;
+            mergeSQL += `  UPDATE SET\n    ${updateSetClause}\n`;
+            mergeSQL += `WHEN NOT MATCHED THEN\n`;
+            mergeSQL += `  INSERT (${columnNames}, _loaded_at)\n`;
+            mergeSQL += `  VALUES (${JSON_DATA.columns.map(col => `SOURCE.${col.name}`).join(',\n    ')},\n    CURRENT_TIMESTAMP(2));\n\n`;
+
+            var mergeStmt = snowflake.createStatement({
+                sqlText: mergeSQL
+            });
+            mergeStmt.execute();
+
+            // Add logging statements
+            //var loggingSQL = `SELECT\n`;
+            //loggingSQL += `  'MERGE Results for ' || '${targetTableName}' as OPERATION,\n`;
+            //loggingSQL += `  SYSTEM$LAST_QUERY_ID() as QUERY_ID,\n`;
+            //loggingSQL += `  (SELECT COUNT(*) FROM ${tempTableName}) as SOURCE_ROWS,\n`;
+            //loggingSQL += `  SYSTEM$MERGE_ROWS_INSERTED() as ROWS_INSERTED,\n`;
+            //loggingSQL += `  SYSTEM$MERGE_ROWS_UPDATED() as ROWS_UPDATED,\n`;
+            //loggingSQL += `  SYSTEM$MERGE_ROWS_DELETED() as ROWS_DELETED;\n\n`;
+            //
+            //var loggingStmt = snowflake.createStatement({
+            //    sqlText: loggingSQL
+            //});
+            //loggingStmt.execute();
+
+            // Clean up
+            var dropTempTableSQL = `DROP TABLE IF EXISTS ${tempTableName};`;
+            var dropTempTableStmt = snowflake.createStatement({
+                sqlText: dropTempTableSQL
+            });
+            dropTempTableStmt.execute();
             
             // Add success message to results
             allResults.push(`${debugInfo}
@@ -218,9 +251,9 @@ $$
 -- CREATE/ALTER TABLE Statement:
 ${existingColumns.size === 0 ? createTableSQL : (needsAlter ? alterTableSQL : 'No schema changes needed')}
 
--- Data Load Method: ${needsAlter || existingColumns.size === 0 ? 'INSERT INTO' : 'COPY INTO'}
+-- Data Load Method: MERGE
 -- Data Load Statement:
-${needsAlter || existingColumns.size === 0 ? insertSQL : copySQL}`);
+${mergeSQL}`);
         } catch (err) {
             // Add error message to results
             allResults.push(`${debugInfo}
@@ -228,11 +261,10 @@ ${needsAlter || existingColumns.size === 0 ? insertSQL : copySQL}`);
 -- Error processing table ${targetTableName}:
 -- ${err}
 -- CREATE/ALTER TABLE Statement:
-${existingColumns.size === 0 ? createTableSQL : (needsAlter ? alterTableSQL : 'No schema changes needed')}
+${createTableSQL}
 
--- Data Load Method: ${needsAlter || existingColumns.size === 0 ? 'INSERT INTO' : 'COPY INTO'}
--- Data Load Statement:
-${needsAlter || existingColumns.size === 0 ? insertSQL : copySQL}`);
+-- Attempted Operation:
+${err.operation || 'Unknown operation'}`);
         }
     }
     
@@ -245,4 +277,7 @@ ${needsAlter || existingColumns.size === 0 ? insertSQL : copySQL}`);
 $$;
 
 -- Execute the procedure
-CALL CREATE_TABLE_FROM_JSON(); 
+CALL CREATE_TABLE_FROM_JSON();
+
+--DROP TABLE IF EXISTS APRICOT_DEV_RAW.COMMON.apricot_116558_data_4;
+--DROP TABLE IF EXISTS APRICOT_DEV_RAW.COMMON.apricot_116558_data_62;

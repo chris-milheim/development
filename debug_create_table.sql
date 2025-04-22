@@ -1,11 +1,17 @@
+-- Execute the procedure
+CALL DEBUG_CREATE_TABLE();
 CREATE OR REPLACE PROCEDURE DEBUG_CREATE_TABLE()
 RETURNS STRING
 LANGUAGE JAVASCRIPT
 AS
 $$
     // Get all rows from the table
+    //  WHERE raw_json_data:metadata.tenant_id = 'apricot_103326' AND raw_json_data:metadata.source_table = 'data_16'
+    // raw_json_data:metadata.tenant_id = 'apricot_116558' AND raw_json_data:metadata.source_table IN ('data_4') AND raw_json_data:metadata.extract_timestamp::TIMESTAMP > '2025-04-17 00:00:00'
+    // loaded_at > DATEADD(HOURS, -1, CURRENT_TIMESTAMP())
+    // 103326 - data_176, data_16
     var getJSONData = snowflake.createStatement({
-        sqlText: `SELECT * FROM APRICOT_DEV_RAW.COMMON.dev_cvi_raw_poc`
+        sqlText: `SELECT * FROM APRICOT_DEV_RAW.COMMON.dev_cvi_raw_poc WHERE raw_json_data:metadata.tenant_id = 'apricot_116558' AND raw_json_data:metadata.source_table IN ('data_4')`
     });
     var result = getJSONData.execute();
     
@@ -55,6 +61,8 @@ $$
                     return 'DATE';
                 case 'JSON':
                     return 'VARIANT';
+                case 'BLOB':
+                    return 'VARIANT';
                 default:
                     return dataType.toUpperCase();
             }
@@ -63,17 +71,38 @@ $$
         // Function to generate column definition
         function generateColumnDef(column, includeDefaults = true) {
             let def = `${column.name} ${getSQLDataType(column.data_type, column.max_length)}`;
-            if (!column.nullable) {
-                def += ' NOT NULL';
-            }
-            if (includeDefaults && column.default_value !== null) {
-                if (column.data_type.toUpperCase() === 'TIMESTAMP') {
-                    // For TIMESTAMP, use a valid default like '1970-01-01 00:00:00'
-                    def += ` DEFAULT TIMESTAMP_NTZ_FROM_PARTS(1970, 1, 1, 0, 0, 0)`;
-                } else {
-                    def += ` DEFAULT ${column.default_value === '' ? "''" : column.default_value}`;
-                }
-            }
+            
+            // Handle NOT NULL constraint
+            // Always apply NOT NULL if column is not nullable, regardless of default value
+            // if (!column.nullable) {
+            //     def += ' NOT NULL';
+            // }
+            
+            // Handle default values only if includeDefaults is true
+            // if (includeDefaults && column.default_value !== null) {
+            //     switch(column.data_type.toUpperCase()) {
+            //         case 'TIMESTAMP':
+            //             def += ` DEFAULT TIMESTAMP_NTZ_FROM_PARTS(1970, 1, 1, 0, 0, 0)`;
+            //             break;
+            //         case 'DATE':
+            //             def += ` DEFAULT DATE_FROM_PARTS(1970, 1, 1)`;
+            //             break;
+            //         case 'VARCHAR':
+            //             def += ` DEFAULT ${column.default_value === '' ? "''" : `'${column.default_value}'`}`;
+            //             break;
+            //         case 'INTEGER':
+            //         case 'TINYINT':
+            //             def += ` DEFAULT ${column.default_value || 0}`;
+            //             break;
+            //         case 'JSON':
+            //         case 'VARIANT':
+            //             def += ` DEFAULT PARSE_JSON('{}')`;
+            //             break;
+            //         default:
+            //             def += ` DEFAULT ${column.default_value}`;
+            //     }
+            // }
+            
             return def;
         }
 
@@ -83,6 +112,7 @@ $$
         // Add columns
         const columnDefs = JSON_DATA.columns.map(col => generateColumnDef(col, true));
         createTableSQL += columnDefs.join(',\n');
+        createTableSQL += ',\n_loaded_at TIMESTAMP_LTZ(9) DEFAULT CURRENT_TIMESTAMP()';
         
         // Add primary key if exists
         if (JSON_DATA.keys.primary_key && JSON_DATA.keys.primary_key.length > 0) {
@@ -121,47 +151,69 @@ $$
         
         // Generate INSERT or COPY statement based on whether we need to alter the table
         var dataLoadSQL;
-        if (needsAlter || existingColumns.size === 0) {
-            // Use INSERT INTO when we've altered the table or created it
-            dataLoadSQL = `INSERT INTO ${targetTableName}\n`;
-            dataLoadSQL += `SELECT\n`;
-            
-            // Add column list for INSERT
-            const columnList = JSON_DATA.columns.map(col => 
-                `f.value:${col.name}::${getSQLDataType(col.data_type, col.max_length)}`
-            ).join(',\n    ');
-            
-            dataLoadSQL += `    ${columnList}\n`;
-            dataLoadSQL += `FROM TABLE(FLATTEN(input => PARSE_JSON('${JSON.stringify(JSON_DATA.data)}'))) f;`;
-        } else {
-            // Use COPY INTO when no schema changes were needed
-            var tempTableName = `${targetTableName}_TEMP`;
-            var stageName = `${targetTableName}_STAGE`;
-            
-            dataLoadSQL = `-- Create temporary table\n`;
-            dataLoadSQL += `CREATE OR REPLACE TEMPORARY TABLE ${tempTableName} (data VARIANT);\n\n`;
-            
-            dataLoadSQL += `-- Insert JSON data into temporary table\n`;
-            dataLoadSQL += `INSERT INTO ${tempTableName} SELECT PARSE_JSON('${JSON.stringify(JSON_DATA.data)}');\n\n`;
-            
-            dataLoadSQL += `-- Create stage\n`;
-            dataLoadSQL += `CREATE OR REPLACE STAGE ${stageName};\n\n`;
-            
-            dataLoadSQL += `-- Copy data from temporary table to stage\n`;
-            dataLoadSQL += `COPY INTO @${stageName}/data.json FROM ${tempTableName} FILE_FORMAT = (TYPE = 'JSON');\n\n`;
-            
-            dataLoadSQL += `-- Copy data from stage to target table\n`;
-            dataLoadSQL += `COPY INTO ${targetTableName}\n`;
-            dataLoadSQL += `FROM @${stageName}\n`;
-            dataLoadSQL += `FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = TRUE)\n`;
-            dataLoadSQL += `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE\n`;
-            dataLoadSQL += `FORCE = TRUE;\n\n`;
-            
-            dataLoadSQL += `-- Clean up\n`;
-            dataLoadSQL += `DROP STAGE IF EXISTS ${stageName};\n`;
-            dataLoadSQL += `DROP TABLE IF EXISTS ${tempTableName};`;
+        if (!JSON_DATA.keys.primary_key || JSON_DATA.keys.primary_key.length === 0) {
+            throw "Error: Primary key is required for MERGE operation";
         }
-        
+
+        // Create a temporary table to hold the new data
+        var tempTableName = `${targetTableName}_TEMP`;
+        dataLoadSQL = `-- Create temporary table with same structure as target\n`;
+        dataLoadSQL += `CREATE OR REPLACE TEMPORARY TABLE ${tempTableName} (\n`;
+        dataLoadSQL += columnDefs.join(',\n');
+        dataLoadSQL += '\n);\n\n';
+
+        // Insert the JSON data into the temporary table
+        const escapedJSONData = JSON.stringify(JSON_DATA.data)
+                .replace(/\\/g, '\\\\')
+                .replace(/'/g, "\\'");
+
+        // Add column list for INSERT
+        const columnNames = JSON_DATA.columns.map(col => col.name).join(',\n    ');
+        const columnValues = JSON_DATA.columns.map(col => {
+            if (col.data_type.toUpperCase() === 'JSON') {
+                return `PARSE_JSON(f.value:${col.name}::STRING)`;
+            }
+            return `f.value:${col.name}::${getSQLDataType(col.data_type, col.max_length)}`;
+        }).join(',\n    ');
+
+        dataLoadSQL += `-- Load JSON data into temporary table\n`;
+        dataLoadSQL += `INSERT INTO ${tempTableName} (${columnNames})\n`;
+        dataLoadSQL += `SELECT\n    ${columnValues}\n`;
+        dataLoadSQL += `FROM TABLE(FLATTEN(input => PARSE_JSON('${escapedJSONData}'))) f;\n\n`;
+
+        // Generate MERGE statement
+        const primaryKeyJoinCondition = JSON_DATA.keys.primary_key
+            .map(key => `TARGET.${key} = SOURCE.${key}`)
+            .join(' AND ');
+
+        const updateSetClause = JSON_DATA.columns
+            .filter(col => !JSON_DATA.keys.primary_key.includes(col.name))
+            .map(col => `${col.name} = SOURCE.${col.name}`)
+            .join(',\n    ');
+
+        dataLoadSQL += `-- Perform MERGE operation\n`;
+        dataLoadSQL += `MERGE INTO ${targetTableName} AS TARGET\n`;
+        dataLoadSQL += `USING ${tempTableName} AS SOURCE\n`;
+        dataLoadSQL += `ON ${primaryKeyJoinCondition}\n`;
+        dataLoadSQL += `WHEN MATCHED THEN\n`;
+        dataLoadSQL += `  UPDATE SET\n    ${updateSetClause}\n`;
+        dataLoadSQL += `WHEN NOT MATCHED THEN\n`;
+        dataLoadSQL += `  INSERT (${columnNames}, _loaded_at)\n`;
+        dataLoadSQL += `  VALUES (${JSON_DATA.columns.map(col => `SOURCE.${col.name}`).join(',\n    ')},\n    CURRENT_TIMESTAMP(2));\n\n`;
+
+        // Add logging statements
+        dataLoadSQL += `-- Log MERGE operation results\n`;
+        dataLoadSQL += `SELECT\n`;
+        dataLoadSQL += `  'MERGE Results for ' || '${targetTableName}' as OPERATION,\n`;
+        dataLoadSQL += `  SYSTEM$LAST_QUERY_ID() as QUERY_ID,\n`;
+        dataLoadSQL += `  (SELECT COUNT(*) FROM ${tempTableName}) as SOURCE_ROWS,\n`;
+        dataLoadSQL += `  SYSTEM$MERGE_ROWS_INSERTED() as ROWS_INSERTED,\n`;
+        dataLoadSQL += `  SYSTEM$MERGE_ROWS_UPDATED() as ROWS_UPDATED,\n`;
+        dataLoadSQL += `  SYSTEM$MERGE_ROWS_DELETED() as ROWS_DELETED;\n\n`;
+
+        dataLoadSQL += `-- Clean up\n`;
+        dataLoadSQL += `DROP TABLE IF EXISTS ${tempTableName};`;
+
         // Add to results
         allResults.push(`${debugInfo}
 
@@ -174,7 +226,7 @@ ${checkTableSQL}
 -- ALTER TABLE Statements:
 ${needsAlter ? alterTableSQL : 'No schema changes needed'}
 
--- Data Load Method: ${needsAlter || existingColumns.size === 0 ? 'INSERT INTO' : 'COPY INTO'}
+-- Data Load Method: MERGE
 -- Data Load Statement:
 ${dataLoadSQL}`);
     }
